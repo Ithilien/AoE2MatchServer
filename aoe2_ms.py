@@ -1,11 +1,13 @@
-import itertools
 import os
+import requests
+import itertools
 
 from googleapiclient.discovery import build
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 
 from flask import Flask
+from flask import request
 
 SPREADSHEET_ID = '1c2Kvc3y1GrF9EFqAKvPoRU8NmFV_exCrAeCTrmDct2Y'
 ELOS_RANGE = 'Prod!A2:ZZ12'
@@ -14,8 +16,9 @@ TEAMS_RANGE = 'Prod!A16:ZZ26'
 app = Flask(__name__);
 
 class Player(object):
-    def __init__(self, name, score):
+    def __init__(self, name, user, score):
         self.name = name
+        self.user = user
         self.score = score
 
     def __eq__(self, other):
@@ -57,7 +60,7 @@ class Match(object):
     def __str__(self):
       return ",".join(sorted([str(team) for team in self.teams]))
         
-class Sheets(object):
+class Backend(object):
     def __init__(self, api_key):
         service = build('sheets', 'v4', developerKey=api_key)
         self._sheets = service.spreadsheets()
@@ -68,29 +71,46 @@ class Sheets(object):
         values = result.get('values', [])
         if not values:
             raise RuntimeError('No elo data found.')
-        elos = {}
+        self.players = {}
         for row in values:
             name = row[0]
-            elos[name] = Player(name, int(row[-1]))
-        return elos
+            user = row[1]
+            self.players[user] = Player(name, user, int(row[-1]))
 
-    def get_current_player_names(self):
-        """Returns the list of players to calculate teams for.
-        This is determined by looking at the "Team" rows of the
-        spreadsheet, and choosing all players with a "?" in the
-        last column.
-        """
-        result = self._sheets.values().get(spreadsheetId=SPREADSHEET_ID,
-                                           range=TEAMS_RANGE).execute()
-        values = result.get('values', [])
-        if not values:
-            raise RuntimeError('No team data found.')
-        players = []
-        last_column = max(len(row) for row in values) - 1
-        for row in values:
-            if last_column < len(row) and row[last_column] == '?':
-                players.append(row[0])
-        return players
+    def get_current_players(self, method="aoe2.net"):
+        current_players = {}
+        if (method == "aoe2.net"):
+            # Get teams from the lobby containing anyone from the AoE2 sheet
+            resp = requests.get("https://aoe2.net/api/lobbies?game=aoe2de")
+            if resp.status_code != 200:
+                raise RuntimeError('aoe2.net responded with code %d' % resp.status_code)
+            lobbies = resp.json()
+            for lobby in lobbies:
+                host = lobby['players'][0]['name']
+                # Check host (assume player 1) to see if its in the group
+                if host and host in self.players:
+                    for p in lobby['players']:
+                        if not p['name']:
+                            continue
+                        if not p['name'] in self.players: 
+                            raise RuntimeError('Unaccounted for players in lobby')
+                        print("Found lobby: '%s'" % lobby['name'])
+                        user = p['name']
+                        current_players[user] = self.players[user]
+                    break;
+        elif (method == "sheets"):
+            # Get teams from the spreadsheet using the old '?' technique
+            result = self._sheets.values().get(spreadsheetId=SPREADSHEET_ID,
+                                               range=TEAMS_RANGE).execute()
+            values = result.get('values', [])
+            if not values:
+                raise RuntimeError('No team data found.')
+            last_column = max(len(row) for row in values) - 1
+            for row in values:
+                if last_column < len(row) and row[last_column] == '?':
+                    user = row[1]
+                    current_players[user] = self.players[user]
+        return current_players
 
 class TeamChooser(object):
     def team_score(self, players):
@@ -113,13 +133,15 @@ class TeamChooser(object):
 
 @app.route('/')
 def run():
+    method = request.args.get('method', default='aoe2.net')
+    num_teams = request.args.get('teams', default=2, type=int)
+    results_to_show = request.args.get('count', default=3, type=int)
     api_key = os.environ['API_KEY']
-    sheets = Sheets(api_key)
-    all_players = sheets.get_players()
-    current = sheets.get_current_player_names()
-    players = { k: v for k, v in all_players.items() if k in current }
+    backend = Backend(api_key)
+    backend.get_players()
+    players = backend.get_current_players(method=method)
     chooser = TeamChooser()
-    matches = chooser.best_teams(players, 2)
+    matches = chooser.best_teams(players, num_teams=num_teams, results_to_show=results_to_show)
 
     style = """
 <style>
